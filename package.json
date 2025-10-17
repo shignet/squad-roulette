@@ -1,0 +1,19 @@
+{
+  "name": "squad-roulette",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "discord.js": "^14.23.2",
+    "dotenv": "^17.2.3",
+    "luxon": "^3.7.2",
+    "node-cron": "^4.2.1"
+  }
+}
