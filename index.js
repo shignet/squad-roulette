@@ -107,6 +107,10 @@ function setWeekData(weekId, data) {
 }
 
 function getWeek(weekId) {
+  if (!weekId) {
+    console.warn('[getWeek] called without weekId');
+    return null;
+  }
   const row = db.prepare('SELECT * FROM weeks WHERE week_id = ?').get(weekId);
   if (!row) return null;
   return {
@@ -119,6 +123,21 @@ function getWeek(weekId) {
 
 function findMostRecentWeek() {
   const row = db.prepare('SELECT * FROM weeks ORDER BY week_start DESC LIMIT 1').get();
+  if (!row) return null;
+  return {
+    ...row,
+    participants: row.participants ? JSON.parse(row.participants) : [],
+    leaders: row.leaders ? JSON.parse(row.leaders) : [],
+    votes: row.votes ? JSON.parse(row.votes) : {},
+  };
+}
+
+function findLatestVotingWeek() {
+  const row = db.prepare(
+    `SELECT * FROM weeks
+     WHERE vote_message_id IS NOT NULL AND vote_message_id <> ''
+     ORDER BY week_start DESC LIMIT 1`
+  ).get();
   if (!row) return null;
   return {
     ...row,
@@ -155,8 +174,16 @@ const commands = [
     .setName('anmeldungen')
     .setDescription('Zeigt alle Anmeldungen für eine Woche')
     .addStringOption(o =>
-      o.setName('woche').setDescription('ISO-Woche, z. B. 2025-W42').setRequired(false)
-    ),
+      o.setName('woche').setDescription('ISO-Woche, z. B. 2025-W42').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+  .setName('votestand')
+  .setDescription('Zeigt den aktuellen Zwischenstand der Abstimmung')
+  .addStringOption(o =>
+    o.setName('woche')
+     .setDescription('ISO-Woche, z. B. 2025-W43 (optional)')
+     .setRequired(false)
+  ),
   new SlashCommandBuilder()
     .setName('force')
     .setDescription('Admin: führe einen Job sofort aus')
@@ -216,6 +243,59 @@ client.on('interactionCreate', async (interaction) => {
         });
       }
 
+      if (interaction.commandName === 'votestand') {
+        const weekOpt = interaction.options.getString('woche');
+        let w = null;
+
+        if (weekOpt && weekOpt.trim()) {
+          w = getWeek(weekOpt.trim());
+        } else {
+          w = findLatestVotingWeek();
+          // Fallback: falls nix gefunden, probiere die aktuelle Woche
+          if (!w) {
+            const monday = mondayOfWeek(now());
+            const currentId = weekIdFromMonday(monday);
+            w = getWeek(currentId);
+          }
+        }
+
+        if (!w) {
+          return interaction.reply({ content: 'Keine passende Woche gefunden 🤷‍♂️', ephemeral: true });
+        }
+        if (!w.leaders || w.leaders.length === 0) {
+          return interaction.reply({ content: `Für **${w.week_id}** gibt es (noch) keine ausgelosten Kandidaten.`, ephemeral: true });
+        }
+
+        // Tally berechnen
+        const tally = new Map(w.leaders.map(id => [id, 0]));
+        Object.values(w.votes || {}).forEach(candidateId => {
+          if (tally.has(candidateId)) tally.set(candidateId, tally.get(candidateId) + 1);
+        });
+
+        const totalVotes = Array.from(tally.values()).reduce((a, b) => a + b, 0);
+        const names = await mentionList(w.leaders);
+        const lines = w.leaders.map((id, i) => {
+          const votes = tally.get(id) || 0;
+          return `**${i + 1}.** ${names[i]} — **${votes}** Stimme(n)`;
+        });
+
+        // Info zur Restzeit (näherungsweise): Voting schließt Montag 10:00 der Folgewoche bezogen auf w.week_start
+        const closeDt = DateTime.fromISO(w.week_start).setZone(TZ).plus({ days: 7, hours: 10 });
+        const remaining = closeDt.diff(now(), ['hours', 'minutes']).toObject();
+        const restText = (remaining.hours >= 0 || remaining.minutes >= 0)
+          ? `Noch ~${Math.max(0, Math.trunc(remaining.hours || 0))}h ${Math.max(0, Math.trunc(remaining.minutes || 0))}m`
+          : `Voting sollte geschlossen sein`;
+
+        const embed = new EmbedBuilder()
+          .setTitle(`🗳️ Zwischenstand – Woche ${w.week_id}`)
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: `Gesamtstimmen: ${totalVotes} • ${restText}` })
+          .setColor(0x57F287);
+
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+
       if (interaction.commandName === 'force') {
         const job = interaction.options.getString('job', true);
         const weekOpt = interaction.options.getString('woche') || null;
@@ -274,12 +354,18 @@ client.on('interactionCreate', async (interaction) => {
 
 // --- Jobs ---
 function scheduleJobs() {
-  cron.schedule(SIGNUP_POST_CRON, postSignup, { timezone: TZ });
-  cron.schedule(PICK_LEADERS_CRON, pickLeaders, { timezone: TZ });
-  cron.schedule(VOTE_REMINDER_CRON, postVoteReminder, { timezone: TZ });
-  cron.schedule(CLOSE_VOTE_CRON, closeVoteAndAward, { timezone: TZ });
-  cron.schedule('0 15 10 * * 1', cleanupInactivity, { timezone: TZ });
+  cron.schedule(SIGNUP_POST_CRON, () => safeRun('signup', postSignup), { timezone: TZ });
+  cron.schedule(PICK_LEADERS_CRON, () => safeRun('pick', pickLeaders), { timezone: TZ });
+  cron.schedule(VOTE_REMINDER_CRON, () => safeRun('remind', postVoteReminder), { timezone: TZ });
+  cron.schedule(CLOSE_VOTE_CRON, () => safeRun('close', closeVoteAndAward), { timezone: TZ });
+  cron.schedule('0 15 10 * * 1', () => safeRun('cleanup', cleanupInactivity), { timezone: TZ });
 }
+
+async function safeRun(name, fn) {
+  try { await fn(); }
+  catch (e) { console.error(`[job:${name}] failed:`, e); }
+}
+
 
 // --- Core Functions ---
 async function postSignup() {
@@ -301,7 +387,7 @@ async function postSignup() {
     .setDescription(
       `Melde dich jetzt für die Woche **${nextMonday.toFormat('dd.MM.')}–${nextMonday.plus({ days: 6 }).toFormat('dd.MM.')}** an!\n\n` +
       `**Anmeldeschluss:** Montag, ${deadline.toFormat('dd.MM. HH:mm')} Uhr\n` +
-      `Nach Anmeldeschluss werden **3 Squadleads** zufällig gezogen.`
+      `Nach Anmeldeschluss werden **3 Squadleads** zufällig gezogen.\n||<@&836289597163176047>||`
     )
     .setColor(0x5865F2)
     .setFooter({ text: `Woche ${weekId}` });
@@ -354,21 +440,31 @@ async function pickLeaders(weekIdOverride = null) {
 async function postVoteReminder(weekIdOverride = null) {
   let weekId, w, monday;
 
-  if (weekIdOverride) {
-    weekId = weekIdOverride;
+  if (weekIdOverride && typeof weekIdOverride === 'string' && weekIdOverride.trim()) {
+    weekId = weekIdOverride.trim();
     w = getWeek(weekId);
     monday = w?.week_start ? DateTime.fromISO(w.week_start).setZone(TZ) : mondayOfWeek(now());
   } else {
     const dt = now();
     monday = mondayOfWeek(dt);
     weekId = weekIdFromMonday(monday);
+    if (!weekId) {
+      console.warn('[remind] no computed weekId, abort');
+      return;
+    }
     w = getWeek(weekId);
   }
 
-  if (!w?.leaders?.length) return;
-
+  if (!w) {
+    console.log(`[remind] no week row for ${weekId} — nothing to post`);
+    return;
+  }
+  if (!w.leaders?.length) {
+    console.log(`[remind] week ${weekId} has no leaders yet`);
+    return;
+  }
   if (w.vote_message_id) {
-    console.log(`[remind] Vote already posted for ${weekId}`);
+    console.log(`[remind] vote already posted for ${weekId} (messageId=${w.vote_message_id})`);
     return;
   }
 
@@ -378,8 +474,8 @@ async function postVoteReminder(weekIdOverride = null) {
   const embed = new EmbedBuilder()
     .setTitle('🗳️ Abstimmung: Squadlead der Woche')
     .setDescription(
-      `Stimme jetzt ab, wer in **Woche ${w.week_id}** der *Squadlead der Woche* war!\n\n` +
-      names.map((n, i) => `**${i + 1}.** ${n}`).join('\n')
+      `Stimme jetzt ab, wer in **Woche ${w.week_id}** der *Squadlead der Woche* war! @\n\n` +
+      names.map((n, i) => `**${i + 1}.** ${n}`).join('\n||<@&836289597163176047>||\n')
     )
     .setColor(0x57F287)
     .setFooter({ text: 'Abstimmung offen bis Montag 10:00' });
@@ -400,22 +496,23 @@ async function postVoteReminder(weekIdOverride = null) {
 async function closeVoteAndAward(weekIdOverride = null) {
   let weekId, w;
 
-  if (weekIdOverride) {
-    weekId = weekIdOverride;
+  if (weekIdOverride && typeof weekIdOverride === 'string' && weekIdOverride.trim()) {
+    weekId = weekIdOverride.trim();
     w = getWeek(weekId);
   } else {
     const dt = now();
     const lastMonday = mondayOfWeek(dt.minus({ weeks: 1 }));
     weekId = weekIdFromMonday(lastMonday);
+    if (!weekId) {
+      console.warn('[close] no computed weekId, abort');
+      return;
+    }
     w = getWeek(weekId);
   }
 
-  if (!w?.leaders?.length) return;
-
-  if (w.vote_closed) {
-    console.log(`[close] Vote already closed for ${weekId}`);
-    return;
-  }
+  if (!w) { console.log(`[close] no week row for ${weekId}`); return; }
+  if (!w.leaders?.length) { console.log(`[close] no leaders for ${weekId}`); return; }
+  if (w.vote_closed) { console.log(`[close] already closed ${weekId}`); return; }
 
   const tally = new Map(w.leaders.map(id => [id, 0]));
   Object.entries(w.votes || {}).forEach(([_, candidate]) => {
