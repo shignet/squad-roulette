@@ -25,6 +25,7 @@ Points are tracked automatically — collect 3 to earn the **Squadleader** role,
   | `/punkte` | Shows your current SL points |
   | `/leaderboard` | Displays top Squadleaders |
   | `/anmeldungen` | Shows all current signups |
+  | `/votestand` | Shows current votes |
   | `/force job:<type>` | Admin-only: manually trigger signup, pick, reminder, close, or cleanup |
 
 - 💾 **Persistent Storage**
