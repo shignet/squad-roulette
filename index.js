@@ -23,6 +23,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const SQUADLEADER_ROLE_ID = process.env.SQUADLEADER_ROLE_ID;
+const NOTIFICATION_ROLE_ID = process.env.NOTIFICATION_ROLE_ID || SQUADLEADER_ROLE_ID;
 const TZ = process.env.TIMEZONE || 'Europe/Berlin';
 const SIGNUP_POST_CRON = process.env.SIGNUP_POST_CRON || '0 0 12 * * 5';   // Freitag 12:00
 const PICK_LEADERS_CRON = process.env.PICK_LEADERS_CRON || '0 0 12 * * 1'; // Montag 12:00
@@ -57,8 +58,8 @@ CREATE TABLE IF NOT EXISTS weeks (
 // DB-Migration: vote_closed-Flag zum Verhindern doppelter Auswertungen
 try {
   db.prepare("ALTER TABLE weeks ADD COLUMN vote_closed INTEGER DEFAULT 0").run();
-} catch (_) {
-  // Spalte existiert schon -> ignorieren
+} catch (e) {
+  if (!e.message.includes('duplicate column')) throw e;
 }
 // --- Helpers ---
 const now = () => DateTime.now().setZone(TZ);
@@ -93,6 +94,12 @@ function setWeekData(weekId, data) {
   if (!current) {
     db.prepare('INSERT INTO weeks (week_id, week_start, participants, leaders, votes) VALUES (?, ?, ?, ?, ?)')
       .run(weekId, data.week_start, JSON.stringify(data.participants || []), JSON.stringify(data.leaders || []), JSON.stringify(data.votes || {}));
+    // Only run UPDATEs for fields not covered by the INSERT
+    if (data.signup_message_id !== undefined)
+      db.prepare('UPDATE weeks SET signup_message_id = ? WHERE week_id = ?').run(data.signup_message_id, weekId);
+    if (data.vote_message_id !== undefined)
+      db.prepare('UPDATE weeks SET vote_message_id = ? WHERE week_id = ?').run(data.vote_message_id, weekId);
+    return;
   }
   if (data.signup_message_id !== undefined)
     db.prepare('UPDATE weeks SET signup_message_id = ? WHERE week_id = ?').run(data.signup_message_id, weekId);
@@ -106,45 +113,34 @@ function setWeekData(weekId, data) {
     db.prepare('UPDATE weeks SET votes = ? WHERE week_id = ?').run(JSON.stringify(data.votes), weekId);
 }
 
+function parseWeekRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    participants: row.participants ? JSON.parse(row.participants) : [],
+    leaders: row.leaders ? JSON.parse(row.leaders) : [],
+    votes: row.votes ? JSON.parse(row.votes) : {},
+  };
+}
+
 function getWeek(weekId) {
   if (!weekId) {
     console.warn('[getWeek] called without weekId');
     return null;
   }
-  const row = db.prepare('SELECT * FROM weeks WHERE week_id = ?').get(weekId);
-  if (!row) return null;
-  return {
-    ...row,
-    participants: row.participants ? JSON.parse(row.participants) : [],
-    leaders: row.leaders ? JSON.parse(row.leaders) : [],
-    votes: row.votes ? JSON.parse(row.votes) : {},
-  };
+  return parseWeekRow(db.prepare('SELECT * FROM weeks WHERE week_id = ?').get(weekId));
 }
 
 function findMostRecentWeek() {
-  const row = db.prepare('SELECT * FROM weeks ORDER BY week_start DESC LIMIT 1').get();
-  if (!row) return null;
-  return {
-    ...row,
-    participants: row.participants ? JSON.parse(row.participants) : [],
-    leaders: row.leaders ? JSON.parse(row.leaders) : [],
-    votes: row.votes ? JSON.parse(row.votes) : {},
-  };
+  return parseWeekRow(db.prepare('SELECT * FROM weeks ORDER BY week_start DESC LIMIT 1').get());
 }
 
 function findLatestVotingWeek() {
-  const row = db.prepare(
+  return parseWeekRow(db.prepare(
     `SELECT * FROM weeks
      WHERE vote_message_id IS NOT NULL AND vote_message_id <> ''
      ORDER BY week_start DESC LIMIT 1`
-  ).get();
-  if (!row) return null;
-  return {
-    ...row,
-    participants: row.participants ? JSON.parse(row.participants) : [],
-    leaders: row.leaders ? JSON.parse(row.leaders) : [],
-    votes: row.votes ? JSON.parse(row.votes) : {},
-  };
+  ).get());
 }
 
 function shuffle(arr) {
@@ -154,6 +150,14 @@ function shuffle(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+function tallyVotes(leaders, votes) {
+  const tally = new Map(leaders.map(id => [id, 0]));
+  Object.values(votes || {}).forEach(candidateId => {
+    if (tally.has(candidateId)) tally.set(candidateId, tally.get(candidateId) + 1);
+  });
+  return tally;
 }
 
 // --- Discord Client ---
@@ -267,11 +271,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // Tally berechnen
-        const tally = new Map(w.leaders.map(id => [id, 0]));
-        Object.values(w.votes || {}).forEach(candidateId => {
-          if (tally.has(candidateId)) tally.set(candidateId, tally.get(candidateId) + 1);
-        });
-
+        const tally = tallyVotes(w.leaders, w.votes);
         const totalVotes = Array.from(tally.values()).reduce((a, b) => a + b, 0);
         const names = await mentionList(w.leaders);
         const lines = w.leaders.map((id, i) => {
@@ -321,7 +321,10 @@ client.on('interactionCreate', async (interaction) => {
         const dt = now();
         const weekId = payload;
         let w = getWeek(weekId);
-        if (!w) setWeekData(weekId, { week_start: dt.toISO(), participants: [] });
+        if (!w) {
+          setWeekData(weekId, { week_start: dt.toISO(), participants: [] });
+          w = getWeek(weekId);
+        }
         const deadline = DateTime.fromISO(w.week_start).setZone(TZ).set({ hour: 12, minute: 0 });
         if (dt > deadline)
           return interaction.reply({ content: 'Anmeldeschluss ist vorbei.', ephemeral: true });
@@ -387,7 +390,7 @@ async function postSignup() {
     .setDescription(
       `Melde dich jetzt für die Woche **${nextMonday.toFormat('dd.MM.')}–${nextMonday.plus({ days: 6 }).toFormat('dd.MM.')}** an!\n\n` +
       `**Anmeldeschluss:** Montag, ${deadline.toFormat('dd.MM. HH:mm')} Uhr\n` +
-      `Nach Anmeldeschluss werden **3 Squadleads** zufällig gezogen.\n||<@&836289597163176047>||`
+      `Nach Anmeldeschluss werden **3 Squadleads** zufällig gezogen.\n||<@&${NOTIFICATION_ROLE_ID}>||`
     )
     .setColor(0x5865F2)
     .setFooter({ text: `Woche ${weekId}` });
@@ -448,10 +451,6 @@ async function postVoteReminder(weekIdOverride = null) {
     const dt = now();
     monday = mondayOfWeek(dt);
     weekId = weekIdFromMonday(monday);
-    if (!weekId) {
-      console.warn('[remind] no computed weekId, abort');
-      return;
-    }
     w = getWeek(weekId);
   }
 
@@ -475,7 +474,7 @@ async function postVoteReminder(weekIdOverride = null) {
     .setTitle('🗳️ Abstimmung: Squadlead der Woche')
     .setDescription(
       `Stimme jetzt ab, wer in **Woche ${w.week_id}** der *Squadlead der Woche* war! @\n\n` +
-      names.map((n, i) => `**${i + 1}.** ${n}`).join('\n||<@&836289597163176047>||\n')
+      names.map((n, i) => `**${i + 1}.** ${n}`).join(`\n||<@&${NOTIFICATION_ROLE_ID}>||\n`)
     )
     .setColor(0x57F287)
     .setFooter({ text: 'Abstimmung offen bis Montag 10:00' });
@@ -503,10 +502,6 @@ async function closeVoteAndAward(weekIdOverride = null) {
     const dt = now();
     const lastMonday = mondayOfWeek(dt.minus({ weeks: 1 }));
     weekId = weekIdFromMonday(lastMonday);
-    if (!weekId) {
-      console.warn('[close] no computed weekId, abort');
-      return;
-    }
     w = getWeek(weekId);
   }
 
@@ -514,12 +509,19 @@ async function closeVoteAndAward(weekIdOverride = null) {
   if (!w.leaders?.length) { console.log(`[close] no leaders for ${weekId}`); return; }
   if (w.vote_closed) { console.log(`[close] already closed ${weekId}`); return; }
 
-  const tally = new Map(w.leaders.map(id => [id, 0]));
-  Object.entries(w.votes || {}).forEach(([_, candidate]) => {
-    if (tally.has(candidate)) tally.set(candidate, tally.get(candidate) + 1);
-  });
+  const tally = tallyVotes(w.leaders, w.votes);
+  const totalVotes = Array.from(tally.values()).reduce((a, b) => a + b, 0);
+  db.prepare('UPDATE weeks SET vote_closed = 1 WHERE week_id = ?').run(weekId);
 
-  const maxVotes = Math.max(0, ...Array.from(tally.values()));
+  if (totalVotes === 0) {
+    const names = await mentionList(w.leaders);
+    await postToChannel(`✅ **Abstimmung geschlossen (Woche ${weekId})**\n` +
+      names.map((n, i) => `Kandidat ${i + 1}: ${n} — **0** Stimme(n)`).join('\n') +
+      `\n\n⚠️ Keine Stimmen abgegeben – kein Punkt vergeben.`);
+    return;
+  }
+
+  const maxVotes = Math.max(...Array.from(tally.values()));
   const top = Array.from(tally.entries()).filter(([_, v]) => v === maxVotes).map(([id]) => id);
   const winner = top[Math.floor(Math.random() * top.length)];
 
@@ -531,8 +533,6 @@ async function closeVoteAndAward(weekIdOverride = null) {
   if (member && pts >= 3 && !member.roles.cache.has(SQUADLEADER_ROLE_ID)) {
     await member.roles.add(SQUADLEADER_ROLE_ID).catch(() => null);
   }
-
-  db.prepare('UPDATE weeks SET vote_closed = 1 WHERE week_id = ?').run(weekId);
 
   const names = await mentionList(w.leaders);
   const winnerName = await mentionList([winner]);
@@ -566,13 +566,21 @@ async function postToChannel(text) {
 
 async function mentionList(userIds) {
   const guild = await client.guilds.fetch(GUILD_ID);
-  const out = [];
-  for (const id of userIds) {
+  return Promise.all(userIds.map(async (id) => {
     const member = await guild.members.fetch(id).catch(() => null);
-    out.push(member ? `${member} (${member.displayName})` : `<@${id}>`);
-  }
-  return out;
+    return member ? `${member} (${member.displayName})` : `<@${id}>`;
+  }));
 }
+
+// --- Graceful Shutdown ---
+function shutdown() {
+  console.log('Shutting down…');
+  db.close();
+  client.destroy();
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 // --- Login ---
 client.login(TOKEN);
