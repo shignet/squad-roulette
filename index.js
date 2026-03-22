@@ -375,21 +375,24 @@ async function safeRun(name, fn) {
 async function postSignup() {
   const channel = await client.channels.fetch(CHANNEL_ID);
   const dt = now();
-  const nextMonday = mondayOfWeek(dt.plus({ weeks: 1 }));
-  const weekId = weekIdFromMonday(nextMonday);
+  // Mon–Thu: target current week; Fri–Sun (cron): target next week
+  const targetMonday = dt.weekday < 5
+    ? mondayOfWeek(dt)
+    : mondayOfWeek(dt.plus({ weeks: 1 }));
+  const weekId = weekIdFromMonday(targetMonday);
   // Doppel-Post-Schutz: Wenn schon ein Signup für diese Woche existiert, abbrechen
   const existing = getWeek(weekId);
   if (existing?.signup_message_id) {
     console.log(`[signup] Skipping duplicate signup for ${weekId} (messageId=${existing.signup_message_id})`);
     return;
   }
-  setWeekData(weekId, { week_start: nextMonday.toISO(), participants: [] });
-  const deadline = nextMonday.set({ hour: 12, minute: 0 });
+  setWeekData(weekId, { week_start: targetMonday.toISO(), participants: [] });
+  const deadline = targetMonday.set({ hour: 12, minute: 0 });
 
   const embed = new EmbedBuilder()
     .setTitle('🎲 Squad-Roulette – Anmeldung geöffnet')
     .setDescription(
-      `Melde dich jetzt für die Woche **${nextMonday.toFormat('dd.MM.')}–${nextMonday.plus({ days: 6 }).toFormat('dd.MM.')}** an!\n\n` +
+      `Melde dich jetzt für die Woche **${targetMonday.toFormat('dd.MM.')}–${targetMonday.plus({ days: 6 }).toFormat('dd.MM.')}** an!\n\n` +
       `**Anmeldeschluss:** Montag, ${deadline.toFormat('dd.MM. HH:mm')} Uhr\n` +
       `Nach Anmeldeschluss werden **3 Squadleads** zufällig gezogen.\n||<@&${NOTIFICATION_ROLE_ID}>||`
     )
