@@ -322,7 +322,8 @@ client.on('interactionCreate', async (interaction) => {
         const weekId = payload;
         let w = getWeek(weekId);
         if (!w) {
-          setWeekData(weekId, { week_start: dt.toISO(), participants: [] });
+          const monday = DateTime.fromISO(weekId).setZone(TZ).set({ weekday: 1 }).startOf('day');
+          setWeekData(weekId, { week_start: monday.toISO(), participants: [] });
           w = getWeek(weekId);
         }
         const deadline = DateTime.fromISO(w.week_start).setZone(TZ).set({ hour: 12, minute: 0 });
