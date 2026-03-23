@@ -131,6 +131,10 @@ function getWeek(weekId) {
   return parseWeekRow(db.prepare('SELECT * FROM weeks WHERE week_id = ?').get(weekId));
 }
 
+function deleteWeek(weekId) {
+  db.prepare('DELETE FROM weeks WHERE week_id = ?').run(weekId);
+}
+
 function findMostRecentWeek() {
   return parseWeekRow(db.prepare('SELECT * FROM weeks ORDER BY week_start DESC LIMIT 1').get());
 }
@@ -193,7 +197,7 @@ const commands = [
     .setDescription('Admin: führe einen Job sofort aus')
     .addStringOption(o =>
       o.setName('job')
-        .setDescription('signup|pick|remind|close|cleanup')
+        .setDescription('signup|pick|remind|close|cleanup|reset')
         .setRequired(true))
     .addStringOption(o =>
       o.setName('woche')
@@ -310,6 +314,14 @@ client.on('interactionCreate', async (interaction) => {
         else if (job === 'remind') await postVoteReminder(weekOpt); // optional weekId
         else if (job === 'close') await closeVoteAndAward(weekOpt); // optional weekId
         else if (job === 'cleanup') await cleanupInactivity();
+        else if (job === 'reset') {
+          if (!weekOpt) {
+            await interaction.followUp({ content: '❌ Bitte gib eine Woche an, z. B. `/force job:reset woche:2026-W13`', ephemeral: true });
+            return;
+          }
+          deleteWeek(weekOpt);
+          await interaction.followUp({ content: `🗑️ Woche **${weekOpt}** wurde zurückgesetzt. Du kannst jetzt \`/force job:signup\` erneut ausführen.`, ephemeral: true });
+        }
       }
     }
 
